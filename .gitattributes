@@ -1,0 +1,8 @@
+﻿*.c linguist-language=C
+*.h linguist-language=C
+Bootloader/Core/** -linguist-vendored
+Bootloader/Core/** -linguist-generated
+Application/Core/** -linguist-vendored
+Application/Core/** -linguist-generated
+Bootloader/Drivers/** linguist-vendored
+Application/Drivers/** linguist-vendored

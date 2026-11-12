@@ -1,0 +1,47 @@
+
+# STM32CubeIDE workspace metadata
+.metadata/
+
+# Generated build directories
+**/Debug/
+**/build/
+**/Objects/
+**/Listings/
+
+# CubeIDE Release build output only
+Bootloader/Release/
+Application/Release/
+
+# Compiler output
+*.o
+*.d
+*.elf
+*.map
+*.list
+*.lst
+*.su
+*.cyclo
+*.gcno
+*.gcda
+
+# Firmware binaries (attach separately to GitHub Releases)
+*.bin
+*.hex
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+*.log
+*.tmp
