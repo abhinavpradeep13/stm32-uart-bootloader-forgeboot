@@ -19,6 +19,7 @@ CMD_BEGIN = 0x01
 CMD_DATA = 0x02
 CMD_END = 0x03
 CMD_ABORT = 0x04
+CMD_PING = 0x05
 
 CMD_ACK = 0x80
 CMD_NACK = 0x81
@@ -28,12 +29,17 @@ OFFSET_SIZE = 4
 MAX_DATA_SIZE = MAX_PAYLOAD - OFFSET_SIZE
 
 INITIAL_SEQUENCE = 0
+PING_SEQUENCE = 0xFFFF
 
 APP_START_ADDR = 0x08008000
 APP_END_ADDR = 0x08080000
 APP_MAX_SIZE = APP_END_ADDR - APP_START_ADDR
 
 DEFAULT_BAUDRATE = 115200
+
+DEFAULT_RETRIES = 3
+DEFAULT_TIMEOUT = 5
+PING_TIMEOUT = 2
 
 
 # ============================================================
@@ -54,9 +60,10 @@ def build_packet(command, sequence, payload=b""):
     Construct a ForgeBoot packet.
 
     Format:
-    SYNC1 + SYNC2 + TYPE + SEQUENCE + LENGTH + PAYLOAD + CRC32
+        A5 5A | TYPE | SEQ16 | LEN16 | PAYLOAD | CRC32
 
-    CRC covers TYPE + SEQUENCE + LENGTH + PAYLOAD.
+    Multi-byte fields use little-endian encoding.
+    CRC covers TYPE through PAYLOAD.
     """
 
     if not 0 <= command <= 0xFF:
@@ -76,7 +83,6 @@ def build_packet(command, sequence, payload=b""):
     )
 
     crc_data = header + payload
-
     crc = calculate_crc32(crc_data)
 
     return (
@@ -99,7 +105,9 @@ def validate_firmware(image):
         raise ValueError("Firmware image is too small")
 
     if image_size > APP_MAX_SIZE:
-        raise ValueError("Firmware exceeds application Flash region")
+        raise ValueError(
+            "Firmware exceeds application Flash region"
+        )
 
     initial_msp, reset_vector = struct.unpack_from(
         "<II", image, 0
@@ -141,7 +149,6 @@ def generate_firmware_packets(image):
         4-byte offset + firmware data
 
     Maximum firmware data per packet: 252 bytes.
-    Non-final chunks are multiples of four bytes.
     """
 
     image_size = len(image)
@@ -149,10 +156,7 @@ def generate_firmware_packets(image):
 
     sequence = INITIAL_SEQUENCE
 
-    # --------------------------------------------------------
     # BEGIN
-    # --------------------------------------------------------
-
     begin_payload = struct.pack(
         "<II",
         image_size,
@@ -167,10 +171,7 @@ def generate_firmware_packets(image):
 
     sequence = (sequence + 1) & 0xFFFF
 
-    # --------------------------------------------------------
     # DATA
-    # --------------------------------------------------------
-
     offset = 0
 
     while offset < image_size:
@@ -191,10 +192,7 @@ def generate_firmware_packets(image):
         offset += len(chunk)
         sequence = (sequence + 1) & 0xFFFF
 
-    # --------------------------------------------------------
     # END
-    # --------------------------------------------------------
-
     yield build_packet(
         CMD_END,
         sequence
@@ -227,6 +225,7 @@ def command_name(command):
         CMD_DATA: "DATA",
         CMD_END: "END",
         CMD_ABORT: "ABORT",
+        CMD_PING: "PING",
         CMD_ACK: "ACK",
         CMD_NACK: "NACK"
     }
@@ -266,6 +265,7 @@ def inspect_firmware(firmware_path):
     }
 
     for packet in packets:
+
         command, _, _ = get_packet_information(packet)
 
         if command in counts:
@@ -325,10 +325,7 @@ def receive_response(ser):
     Synchronization: A5 5A
     """
 
-    # --------------------------------------------------------
     # Find synchronization bytes.
-    # --------------------------------------------------------
-
     previous_byte = None
 
     while True:
@@ -340,10 +337,7 @@ def receive_response(ser):
 
         previous_byte = current_byte
 
-    # --------------------------------------------------------
     # Read header.
-    # --------------------------------------------------------
-
     header = read_exact(ser, 5)
 
     packet_type, sequence, payload_length = struct.unpack(
@@ -353,10 +347,7 @@ def receive_response(ser):
     if payload_length > MAX_PAYLOAD:
         raise ValueError("Invalid response payload length")
 
-    # --------------------------------------------------------
     # Read payload and CRC.
-    # --------------------------------------------------------
-
     payload = read_exact(ser, payload_length)
 
     received_crc = struct.unpack(
@@ -370,10 +361,7 @@ def receive_response(ser):
     if received_crc != calculated_crc:
         raise ValueError("Response CRC mismatch")
 
-    # --------------------------------------------------------
     # Validate response.
-    # --------------------------------------------------------
-
     if packet_type == CMD_ACK:
 
         if payload_length != 0:
@@ -385,7 +373,7 @@ def receive_response(ser):
             "payload": payload
         }
 
-    elif packet_type == CMD_NACK:
+    if packet_type == CMD_NACK:
 
         if payload_length != 1:
             raise ValueError("Invalid NACK payload")
@@ -409,8 +397,8 @@ def transmit_packet(
     ser,
     packet,
     sequence,
-    retries=3,
-    timeout=5
+    retries=DEFAULT_RETRIES,
+    timeout=DEFAULT_TIMEOUT
 ):
     """
     Send one packet and wait for its matching ACK.
@@ -476,12 +464,100 @@ def transmit_packet(
 
 
 # ============================================================
+# RECOVERY MODE PREFLIGHT
+# ============================================================
+
+def check_recovery_mode(ser):
+    """
+    Verify that ForgeBoot is in recovery mode.
+
+    Sends PING with sequence 0xFFFF.
+
+    Upload is allowed only after receiving a valid,
+    matching ACK packet.
+    """
+
+    print("\n========== RECOVERY MODE CHECK ==========")
+
+    ping_packet = build_packet(
+        CMD_PING,
+        PING_SEQUENCE
+    )
+
+    print("[PING] Checking bootloader recovery mode...")
+
+    try:
+
+        transmit_packet(
+            ser,
+            ping_packet,
+            PING_SEQUENCE,
+            retries=1,
+            timeout=PING_TIMEOUT
+        )
+
+        print("[SUCCESS] ForgeBoot recovery mode detected.")
+
+        return True
+
+    except (RuntimeError, TimeoutError, ValueError) as error:
+
+        print("\n[ERROR] Recovery mode was not detected.")
+        print("[INFO] Firmware upload has been blocked.")
+        print("[INFO] BEGIN was not transmitted.")
+        print("[INFO] Application Flash has not been erased.")
+        print(f"[DETAIL] {error}")
+
+        return False
+
+
+# ============================================================
+# ABORT RECOVERY
+# ============================================================
+
+def attempt_abort(ser, sequence):
+    """Attempt to abort an interrupted firmware transfer."""
+
+    abort_packet = build_packet(
+        CMD_ABORT,
+        sequence
+    )
+
+    print(
+        "\n[ABORT] Attempting to reset firmware update state..."
+    )
+
+    try:
+
+        transmit_packet(
+            ser,
+            abort_packet,
+            sequence,
+            retries=2,
+            timeout=2
+        )
+
+        print("[ABORT] Bootloader reset to IDLE.")
+
+    except Exception as error:
+
+        print(f"[WARN] ABORT attempt failed: {error}")
+
+
+# ============================================================
 # FIRMWARE UPLOAD
 # ============================================================
 
 def upload_firmware(port, firmware_path):
 
-    image = pathlib.Path(firmware_path).read_bytes()
+    firmware_path = pathlib.Path(firmware_path)
+
+    if not firmware_path.is_file():
+        raise FileNotFoundError(
+            f"Firmware file not found: {firmware_path}"
+        )
+
+    image = firmware_path.read_bytes()
 
     # Validate before opening serial port.
     validate_firmware(image)
@@ -507,35 +583,63 @@ def upload_firmware(port, firmware_path):
 
         time.sleep(0.5)
 
-        # Discard startup messages before packet exchange.
+        # Remove startup messages and stale serial data.
         ser.reset_input_buffer()
 
-        for index, packet in enumerate(packets):
+        # ----------------------------------------------------
+        # RECOVERY MODE PREFLIGHT
+        # ----------------------------------------------------
 
-            _, sequence, _ = get_packet_information(packet)
+        if not check_recovery_mode(ser):
 
-            # BEGIN erases application Flash sectors.
-            if index == 0:
-                timeout = 30
-            else:
-                timeout = 5
-
-            transmit_packet(
-                ser,
-                packet,
-                sequence,
-                retries=3,
-                timeout=timeout
+            raise RuntimeError(
+                "Upload cancelled. Hold PB12 while resetting "
+                "the STM32 to enter ForgeBoot recovery mode."
             )
 
-            progress = (
-                (index + 1) / len(packets)
-            ) * 100
+        # ----------------------------------------------------
+        # FIRMWARE TRANSFER
+        # ----------------------------------------------------
 
-            print(
-                f"[PROGRESS] {progress:.1f}% "
-                f"({index + 1}/{len(packets)})"
-            )
+        print("\n========== STARTING FIRMWARE TRANSFER ==========")
+
+        last_sequence = INITIAL_SEQUENCE
+
+        try:
+
+            for index, packet in enumerate(packets):
+
+                _, sequence, _ = get_packet_information(packet)
+
+                last_sequence = sequence
+
+                # BEGIN performs application Flash erase.
+                if index == 0:
+                    timeout = 30
+                else:
+                    timeout = DEFAULT_TIMEOUT
+
+                transmit_packet(
+                    ser,
+                    packet,
+                    sequence,
+                    retries=DEFAULT_RETRIES,
+                    timeout=timeout
+                )
+
+                progress = (
+                    (index + 1) / len(packets)
+                ) * 100
+
+                print(
+                    f"[PROGRESS] {progress:.1f}% "
+                    f"({index + 1}/{len(packets)})"
+                )
+
+        except (Exception, KeyboardInterrupt):
+
+            attempt_abort(ser, last_sequence)
+            raise
 
     print("\n[FORGEBOOT] Transfer completed successfully.")
 
@@ -586,13 +690,13 @@ class LostAckMockSerial(MockSerial):
     """Simulate losing the first ACK."""
 
     def __init__(self):
+
         super().__init__()
         self.transmission_count = 0
 
     def write(self, data):
 
         self.transmission_count += 1
-
         self.last_written = data
 
         sequence = struct.unpack_from(
@@ -609,6 +713,7 @@ class LostAckMockSerial(MockSerial):
         )
 
         return len(data)
+
 
 # ============================================================
 # OFFLINE TESTS
@@ -729,11 +834,12 @@ def test_retransmission():
 def test_nack_rejection():
 
     sequence = 9
-    reason = 0x05  # NACK_FLASH_ERROR
+    reason = 0x05
 
     class NackMockSerial(MockSerial):
 
         def write(self, data):
+
             self.last_written = data
 
             self.response.extend(
@@ -751,6 +857,7 @@ def test_nack_rejection():
     mock = NackMockSerial()
 
     try:
+
         transmit_packet(
             mock,
             packet,
@@ -760,12 +867,60 @@ def test_nack_rejection():
         )
 
     except RuntimeError as error:
+
         assert "NACK reason: 0x05" in str(error)
+
         print("[PASS] NACK rejection detected")
         print("[PASS] Flash error reason identified")
+
         return
 
     raise AssertionError("NACK was not handled correctly")
+
+
+def test_recovery_mode_check():
+
+    mock = MockSerial()
+
+    result = check_recovery_mode(mock)
+
+    assert result is True
+
+    command, sequence, payload_length = (
+        get_packet_information(mock.last_written)
+    )
+
+    assert command == CMD_PING
+    assert sequence == PING_SEQUENCE
+    assert payload_length == 0
+
+    print("[PASS] Recovery-mode PING packet")
+    print("[PASS] Recovery-mode ACK validation")
+
+
+def test_recovery_mode_rejection():
+
+    class NoResponseMock(MockSerial):
+
+        def write(self, data):
+            self.last_written = data
+            return len(data)
+
+    mock = NoResponseMock()
+
+    result = check_recovery_mode(mock)
+
+    assert result is False
+
+    command, sequence, _ = (
+        get_packet_information(mock.last_written)
+    )
+
+    assert command == CMD_PING
+    assert sequence == PING_SEQUENCE
+
+    print("[PASS] Recovery-mode timeout detection")
+    print("[PASS] Upload preflight rejection")
 
 
 def run_self_tests():
@@ -778,6 +933,8 @@ def run_self_tests():
     test_transmission()
     test_retransmission()
     test_nack_rejection()
+    test_recovery_mode_check()
+    test_recovery_mode_rejection()
 
     print("\n========== ALL TESTS PASSED ==========\n")
 
@@ -789,7 +946,7 @@ def run_self_tests():
 def main():
 
     parser = argparse.ArgumentParser(
-        description="ForgeBoot STM32 Firmware Uploader"
+        description="ForgeBoot v0.2 STM32 Firmware Uploader"
     )
 
     parser.add_argument(
@@ -800,7 +957,7 @@ def main():
 
     parser.add_argument(
         "--port",
-        help="Serial COM port, e.g. COM4"
+        help="Serial COM port, e.g. COM19"
     )
 
     parser.add_argument(
